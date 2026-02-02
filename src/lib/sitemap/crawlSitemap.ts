@@ -20,9 +20,32 @@ function normalizeUrl(input: string): string {
   return `https://${trimmed}`;
 }
 
+function extractSitemapXmlPayload(raw: string): string {
+  // Some WordPress setups serve the sitemap XML inside an HTML shell:
+  // <html><body><urlset ...>...</urlset></body></html>
+  // DOMParser in XML mode can behave inconsistently depending on the wrapper,
+  // so we extract the real sitemap root when possible.
+
+  const candidates: Array<{ open: string; close: string }> = [
+    { open: "<sitemapindex", close: "</sitemapindex>" },
+    { open: "<urlset", close: "</urlset>" },
+  ];
+
+  for (const c of candidates) {
+    const start = raw.indexOf(c.open);
+    if (start === -1) continue;
+    const end = raw.indexOf(c.close, start);
+    if (end === -1) continue;
+    return raw.slice(start, end + c.close.length);
+  }
+
+  return raw;
+}
+
 function safeParseXml(xmlText: string): XMLDocument {
   // Some sitemaps contain bare '&' which breaks DOMParser.
-  const sanitized = xmlText.replace(
+  const payload = extractSitemapXmlPayload(xmlText);
+  const sanitized = payload.replace(
     /&(?!amp;|lt;|gt;|apos;|quot;|#\d+;|#x[a-fA-F0-9]+;)/g,
     "&amp;"
   );
@@ -124,10 +147,10 @@ export async function crawlSitemapUrls(
       batch.map(async (sitemap) => {
         emitProgress(sitemap);
 
-        const xmlText = await fetchSitemapXml(sitemap);
-        const xmlDoc = safeParseXml(xmlText);
+        const rawText = await fetchSitemapXml(sitemap);
+        const xmlDoc = safeParseXml(rawText);
         const kind = getSitemapKind(xmlDoc);
-        const locs = extractLocs(xmlDoc, xmlText);
+        const locs = extractLocs(xmlDoc, rawText);
 
         if (kind === "index") {
           for (const loc of locs) {
