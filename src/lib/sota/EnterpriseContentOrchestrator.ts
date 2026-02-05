@@ -407,23 +407,130 @@ Now continue:`;
     }
 
     // NeuronWriter content score (after links/cleanup so the score reflects what you'll publish)
+    // IMPROVEMENT LOOP: If score < 90%, enhance content with missing terms
     if (neuron) {
       this.log('NeuronWriter: evaluating content score...');
-      const evalRes = await neuron.service.evaluateContent(neuron.queryId, {
-        html: enhancedContent,
-        title,
-      });
+      let currentContent = enhancedContent;
+      let currentScore = 0;
+      const targetScore = 90;
+      const maxImprovementAttempts = 3;
+      
+      // Compile ALL terms for comprehensive suggestions
+      const allTermsForSuggestions = [
+        ...neuron.analysis.terms,
+        ...(neuron.analysis.termsExtended || []),
+      ];
+      
+      // Also include entities as pseudo-terms for suggestions
+      const entityTerms = (neuron.analysis.entities || []).map(e => ({
+        term: e.entity,
+        weight: e.usage_pc || 30,
+        frequency: 1,
+        type: 'recommended' as const,
+        usage_pc: e.usage_pc,
+      }));
+      
+      for (let attempt = 0; attempt <= maxImprovementAttempts; attempt++) {
+        const evalRes = await neuron.service.evaluateContent(neuron.queryId, {
+          html: currentContent,
+          title,
+        });
 
-      if (evalRes.success && typeof evalRes.contentScore === 'number') {
-        neuron.analysis.content_score = evalRes.contentScore;
-      } else {
-        // Fallback: local approximation
-        neuron.analysis.content_score = neuron.service.calculateContentScore(
-          enhancedContent,
-          neuron.analysis.terms || []
-        );
-        if (!evalRes.success) {
-          this.log(`NeuronWriter: evaluate failed (using local score). ${evalRes.error || ''}`.trim());
+        if (evalRes.success && typeof evalRes.contentScore === 'number') {
+          currentScore = evalRes.contentScore;
+          neuron.analysis.content_score = currentScore;
+          
+          if (currentScore >= targetScore || attempt === maxImprovementAttempts) {
+            if (currentScore >= targetScore) {
+              this.log(`NeuronWriter: ✅ Score ${currentScore}% (target: ${targetScore}%+) - PASSED`);
+            } else {
+              this.log(`NeuronWriter: ⚠️ Score ${currentScore}% after ${attempt} improvement attempts (target was ${targetScore}%)`);
+            }
+            enhancedContent = currentContent;
+            break;
+          }
+          
+          // Score below target - try to improve
+          this.log(`NeuronWriter: Score ${currentScore}% (below ${targetScore}%) - improving... (attempt ${attempt + 1}/${maxImprovementAttempts})`);
+          
+          // Get missing terms suggestions from ALL terms (not just a slice)
+          const suggestions = neuron.service.getOptimizationSuggestions(currentContent, allTermsForSuggestions);
+          const entitySuggestions = neuron.service.getOptimizationSuggestions(currentContent, entityTerms);
+          const allSuggestions = [...suggestions, ...entitySuggestions.slice(0, 10)];
+          
+          if (allSuggestions.length > 0) {
+            this.log(`Missing terms to add: ${allSuggestions.slice(0, 5).join(', ')}`);
+            
+            // Use AI to naturally incorporate missing terms
+            const improvementPrompt = `Improve this article by NATURALLY incorporating these missing SEO terms. 
+DO NOT just add them as a list - weave them into existing sentences or add new relevant paragraphs.
+
+MISSING TERMS TO ADD (include ALL of these):
+${allSuggestions.slice(0, 25).join('\n')}
+
+RULES:
+1. Keep ALL existing content - only ADD to it
+2. Terms must flow naturally in sentences
+3. Add terms in context where they make sense
+4. Maintain the article's voice and quality
+5. Add 3-5 new paragraphs if needed to incorporate terms naturally
+6. Include each missing term at least once, ideally 2-3 times in different contexts
+
+CURRENT ARTICLE:
+${currentContent}
+
+OUTPUT: Return the COMPLETE improved article with ALL missing terms naturally woven in.`;
+
+            const improvedResult = await this.engine.generateWithModel({
+              prompt: improvementPrompt,
+              model: this.config.primaryModel || 'gemini',
+              apiKeys: this.config.apiKeys,
+              systemPrompt: 'You are an expert SEO content optimizer. Improve articles by naturally incorporating missing keywords to achieve 90%+ NeuronWriter scores.',
+              temperature: 0.5
+            });
+            
+            if (improvedResult.content && improvedResult.content.length > currentContent.length * 0.8) {
+              currentContent = improvedResult.content;
+            }
+          } else {
+            // No specific suggestions - try a general keyword density improvement
+            this.log(`No specific missing terms found - attempting general keyword optimization...`);
+            
+            const generalPrompt = `This article needs better keyword optimization for SEO. 
+Improve it by:
+1. Adding more variations of the primary topic throughout
+2. Including related terms and synonyms
+3. Strengthening the keyword presence in headings
+4. Adding more specific data points and statistics
+
+Keep ALL existing content and ADD to it. Return the COMPLETE improved article.
+
+CURRENT ARTICLE:
+${currentContent}`;
+
+            const improvedResult = await this.engine.generateWithModel({
+              prompt: generalPrompt,
+              model: this.config.primaryModel || 'gemini',
+              apiKeys: this.config.apiKeys,
+              systemPrompt: 'You are an expert SEO content optimizer.',
+              temperature: 0.6
+            });
+            
+            if (improvedResult.content && improvedResult.content.length > currentContent.length * 0.8) {
+              currentContent = improvedResult.content;
+            }
+          }
+        } else {
+          // Fallback: local approximation
+          neuron.analysis.content_score = neuron.service.calculateContentScore(
+            currentContent,
+            neuron.analysis.terms || []
+          );
+          if (!evalRes.success) {
+            this.log(`NeuronWriter: evaluate failed (using local score). ${evalRes.error || ''}`.trim());
+          }
+          enhancedContent = currentContent;
+          break;
         }
       }
     }
@@ -612,14 +719,32 @@ Output ONLY the title, nothing else.`;
 • Address objections: "Now you might be thinking..." / "I hear you—"
 • Curse mildly if natural: "damn", "hell", "crap" (but not F-bombs)
 
-📐 E-E-A-T SIGNALS (MANDATORY FOR 90%+ SCORE):
-• Cite at least 5 specific studies, reports, or statistics with years (e.g., "A 2024 Harvard study found...")
-• Include 2-3 expert quotes with real names and credentials
-• Mention first-hand experience: "When I tested this..." / "In my 12 years of..."
-• Reference specific tools/products you've personally used
-• Include methodology explanations: "Here's exactly how I measured this..."
-• Add credentials signals: "According to Dr. [Name], a [credential] at [institution]..."
-• Cite industry reports: "[Company] 2024 State of [Industry] Report shows..."
+📐 E-E-A-T SIGNALS (MANDATORY FOR 90%+ SCORE - INCLUDE ALL OF THESE):
+
+**EXPERIENCE (First-hand - use EXPERIENCE BOX template above):**
+• Write 1-2 "My Personal Experience" sections with specific details: dates, numbers, results
+• Use phrases: "When I personally tested this..." / "Over the past 3 years, I've..." / "Here's what happened when I..."
+• Include specific timelines: "After 6 months of implementing this..." / "In my 12 years working with..."
+• Share failures too: "I made this mistake once..." - adds authenticity
+
+**EXPERTISE (Demonstrate deep knowledge):**
+• Cite at least 8 specific studies/reports with years: "A 2024 Stanford study published in [Journal] found..."
+• Include 4-5 expert quotes with REAL names and credentials: "Dr. Sarah Chen, PhD in Exercise Physiology at UCLA, explains..."
+• Reference specific methodologies: "Using the validated FITT protocol..." / "Based on the Cochrane meta-analysis..."
+• Use technical terms then explain them simply
+
+**AUTHORITATIVENESS (Industry recognition):**
+• Cite industry reports: "The 2024 State of [Industry] Report by [Company] shows..."
+• Reference authoritative organizations: CDC, WHO, NIH, peer-reviewed journals
+• Include data tables with sources (use DATA COMPARISON TABLE template)
+• Add "Research Findings" boxes (use RESEARCH BOX template above)
+
+**TRUSTWORTHINESS (Accuracy and transparency):**
+• Include specific dates and version numbers
+• Acknowledge limitations: "This approach works best for..." / "One caveat is..."
+• Cite sources with links/references
+• Include "Last updated: [Date]" signals
+• Be transparent about methodology
 
 📐 MANDATORY HTML STRUCTURE (WORDPRESS-COMPATIBLE ELEMENTS):
 
@@ -631,86 +756,106 @@ Output ONLY the title, nothing else.`;
 1. BLUF HOOK (first 50 words): 
 Start with the ANSWER or a bold statement. No "welcome to" garbage. Give them the gold immediately.
 
-2. KEY TAKEAWAYS BOX (right after hook):
-<div style="background: #f0fdf4; border: 2px solid #10b981; border-radius: 12px; padding: 24px 28px; margin: 32px 0;">
-  <h3 style="color: #047857; margin: 0 0 16px 0; font-size: 22px; font-weight: 700;">🎯 The Bottom Line (TL;DR)</h3>
-  <ul style="color: #1f2937; margin: 0; padding-left: 24px; font-size: 16px; line-height: 1.8;">
-    <li style="margin-bottom: 8px;"><strong>Key insight:</strong> Actionable point here</li>
-    <li style="margin-bottom: 8px;"><strong>Key insight:</strong> Actionable point here</li>
-    <li style="margin-bottom: 0;"><strong>Key insight:</strong> Actionable point here</li>
+2. KEY TAKEAWAYS BOX (right after hook - premium modern design):
+<div style="background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); border: 2px solid #10b981; border-radius: 16px; padding: 28px 32px; margin: 36px 0; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.15);">
+  <h3 style="color: #047857; margin: 0 0 20px 0; font-size: 24px; font-weight: 800; display: flex; align-items: center; gap: 10px;">🎯 The Bottom Line (TL;DR)</h3>
+  <ul style="color: #1f2937; margin: 0; padding-left: 0; font-size: 17px; line-height: 2; list-style: none;">
+    <li style="margin-bottom: 12px; padding-left: 28px; position: relative;"><span style="position: absolute; left: 0; color: #10b981; font-weight: 700;">✓</span> <strong>Key insight:</strong> Actionable point here</li>
+    <li style="margin-bottom: 12px; padding-left: 28px; position: relative;"><span style="position: absolute; left: 0; color: #10b981; font-weight: 700;">✓</span> <strong>Key insight:</strong> Actionable point here</li>
+    <li style="margin-bottom: 0; padding-left: 28px; position: relative;"><span style="position: absolute; left: 0; color: #10b981; font-weight: 700;">✓</span> <strong>Key insight:</strong> Actionable point here</li>
   </ul>
 </div>
 
-3. PRO TIP BOXES (4-6 throughout):
-<div style="background: #eff6ff; border-left: 4px solid #3b82f6; padding: 20px 24px; margin: 28px 0; border-radius: 0 8px 8px 0;">
-  <strong style="color: #1e40af; font-size: 16px; display: block; margin-bottom: 8px;">💡 Pro Tip</strong>
-  <p style="color: #1f2937; font-size: 16px; margin: 0; line-height: 1.7;">Your actionable insider knowledge here.</p>
+3. PRO TIP BOXES (4-6 throughout - modern gradient design):
+<div style="background: linear-gradient(135deg, #eff6ff 0%, #dbeafe 100%); border-left: 5px solid #3b82f6; padding: 24px 28px; margin: 32px 0; border-radius: 0 12px 12px 0; box-shadow: 0 2px 10px rgba(59, 130, 246, 0.1);">
+  <strong style="color: #1e40af; font-size: 18px; display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">💡 Pro Tip</strong>
+  <p style="color: #1f2937; font-size: 17px; margin: 0; line-height: 1.8;">Your actionable insider knowledge here.</p>
 </div>
 
-4. WARNING BOXES (when relevant):
-<div style="background: #fef2f2; border-left: 4px solid #ef4444; padding: 20px 24px; margin: 28px 0; border-radius: 0 8px 8px 0;">
-  <strong style="color: #b91c1c; font-size: 16px; display: block; margin-bottom: 8px;">⚠️ Warning</strong>
-  <p style="color: #1f2937; font-size: 16px; margin: 0; line-height: 1.7;">Critical warning that saves them from a costly mistake.</p>
+4. WARNING BOXES (when relevant - attention-grabbing design):
+<div style="background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border-left: 5px solid #ef4444; padding: 24px 28px; margin: 32px 0; border-radius: 0 12px 12px 0; box-shadow: 0 2px 10px rgba(239, 68, 68, 0.1);">
+  <strong style="color: #b91c1c; font-size: 18px; display: flex; align-items: center; gap: 8px; margin-bottom: 12px;">⚠️ Warning</strong>
+  <p style="color: #1f2937; font-size: 17px; margin: 0; line-height: 1.8;">Critical warning that saves them from a costly mistake.</p>
 </div>
 
-5. DATA COMPARISON TABLE (at least 1):
-<div style="margin: 32px 0; overflow-x: auto;">
-  <table style="width: 100%; border-collapse: collapse; border: 1px solid #e5e7eb;">
+5. DATA COMPARISON TABLE (modern, clean design):
+<div style="margin: 36px 0; overflow-x: auto; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.08);">
+  <table style="width: 100%; border-collapse: collapse; background: white;">
     <thead>
-      <tr style="background: #f9fafb;">
-        <th style="padding: 16px 20px; text-align: left; color: #1f2937; font-weight: 700; border-bottom: 2px solid #10b981;">Column 1</th>
-        <th style="padding: 16px 20px; text-align: left; color: #1f2937; font-weight: 700; border-bottom: 2px solid #10b981;">Column 2</th>
-        <th style="padding: 16px 20px; text-align: left; color: #1f2937; font-weight: 700; border-bottom: 2px solid #10b981;">Column 3</th>
+      <tr style="background: linear-gradient(135deg, #f0fdf4 0%, #dcfce7 100%);">
+        <th style="padding: 18px 24px; text-align: left; color: #047857; font-weight: 800; font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 3px solid #10b981;">Column 1</th>
+        <th style="padding: 18px 24px; text-align: left; color: #047857; font-weight: 800; font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 3px solid #10b981;">Column 2</th>
+        <th style="padding: 18px 24px; text-align: left; color: #047857; font-weight: 800; font-size: 15px; text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 3px solid #10b981;">Column 3</th>
       </tr>
     </thead>
     <tbody>
-      <tr>
-        <td style="padding: 14px 20px; color: #374151; border-bottom: 1px solid #e5e7eb;">Data</td>
-        <td style="padding: 14px 20px; color: #374151; border-bottom: 1px solid #e5e7eb;">Data</td>
-        <td style="padding: 14px 20px; color: #059669; border-bottom: 1px solid #e5e7eb; font-weight: 600;">Highlight</td>
+      <tr style="background: #ffffff;">
+        <td style="padding: 16px 24px; color: #374151; font-size: 16px; border-bottom: 1px solid #e5e7eb;">Data</td>
+        <td style="padding: 16px 24px; color: #374151; font-size: 16px; border-bottom: 1px solid #e5e7eb;">Data</td>
+        <td style="padding: 16px 24px; color: #059669; font-size: 16px; border-bottom: 1px solid #e5e7eb; font-weight: 700;">Highlight ✓</td>
+      </tr>
+      <tr style="background: #f9fafb;">
+        <td style="padding: 16px 24px; color: #374151; font-size: 16px; border-bottom: 1px solid #e5e7eb;">Data</td>
+        <td style="padding: 16px 24px; color: #374151; font-size: 16px; border-bottom: 1px solid #e5e7eb;">Data</td>
+        <td style="padding: 16px 24px; color: #374151; font-size: 16px; border-bottom: 1px solid #e5e7eb;">Data</td>
       </tr>
     </tbody>
   </table>
 </div>
 
-6. NUMBERED STEP BOXES (for how-to sections):
-<div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 12px; padding: 24px; margin: 28px 0;">
-  <div style="display: flex; align-items: center; gap: 16px; margin-bottom: 12px;">
-    <span style="background: #10b981; color: white; width: 36px; height: 36px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 16px;">1</span>
-    <strong style="color: #1f2937; font-size: 18px; font-weight: 700;">Step Title Here</strong>
+6. NUMBERED STEP BOXES (modern step-by-step design):
+<div style="background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%); border: 2px solid #e2e8f0; border-radius: 16px; padding: 28px; margin: 32px 0; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+  <div style="display: flex; align-items: center; gap: 18px; margin-bottom: 16px;">
+    <span style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); color: white; width: 44px; height: 44px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-weight: 800; font-size: 18px; box-shadow: 0 4px 12px rgba(16, 185, 129, 0.3);">1</span>
+    <strong style="color: #1f2937; font-size: 20px; font-weight: 800;">Step Title Here</strong>
   </div>
-  <p style="color: #4b5563; margin: 0; padding-left: 52px; font-size: 16px; line-height: 1.7;">Step description with actionable details.</p>
+  <p style="color: #4b5563; margin: 0; padding-left: 62px; font-size: 17px; line-height: 1.8;">Step description with actionable details.</p>
 </div>
 
-7. QUOTE/CALLOUT BOXES:
-<blockquote style="background: #f0fdf4; border-left: 4px solid #10b981; padding: 24px 28px; margin: 32px 0; border-radius: 0 8px 8px 0;">
-  <p style="color: #1f2937; margin: 0; font-size: 18px; line-height: 1.7; font-style: italic;">"Powerful quote that reinforces your point..."</p>
-  <footer style="color: #6b7280; margin-top: 12px; font-size: 14px; font-style: normal; font-weight: 600;">— Source Name, Title/Company</footer>
+7. EXPERT QUOTE BOXES (premium credibility design):
+<blockquote style="background: linear-gradient(135deg, #f0fdf4 0%, #ecfdf5 100%); border-left: 5px solid #10b981; padding: 28px 32px; margin: 36px 0; border-radius: 0 16px 16px 0; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.1); position: relative;">
+  <p style="color: #1f2937; margin: 0; font-size: 19px; line-height: 1.8; font-style: italic;">"Powerful quote that reinforces your point and adds expert credibility..."</p>
+  <footer style="color: #047857; margin-top: 16px; font-size: 15px; font-style: normal; font-weight: 700; display: flex; align-items: center; gap: 8px;">
+    <span style="background: #10b981; width: 8px; height: 8px; border-radius: 50%; display: inline-block;"></span>
+    Dr. Expert Name, PhD — Harvard Medical School
+  </footer>
 </blockquote>
 
-8. STAT HIGHLIGHT BOX:
-<div style="background: #f8fafc; border: 2px solid #10b981; border-radius: 12px; padding: 24px; margin: 32px 0; display: flex; align-items: center; gap: 20px; flex-wrap: wrap;">
-  <div style="background: #10b981; border-radius: 12px; padding: 16px 20px; text-align: center; min-width: 100px;">
-    <span style="color: white; font-size: 32px; font-weight: 800; display: block;">87%</span>
-    <span style="color: rgba(255,255,255,0.9); font-size: 12px; text-transform: uppercase;">Metric</span>
+8. STAT HIGHLIGHT BOX (eye-catching metric display):
+<div style="background: linear-gradient(135deg, #f0fdf4 0%, #d1fae5 100%); border: 2px solid #10b981; border-radius: 16px; padding: 28px; margin: 36px 0; display: flex; align-items: center; gap: 24px; flex-wrap: wrap; box-shadow: 0 4px 15px rgba(16, 185, 129, 0.15);">
+  <div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); border-radius: 16px; padding: 20px 28px; text-align: center; min-width: 120px; box-shadow: 0 6px 20px rgba(16, 185, 129, 0.3);">
+    <span style="color: white; font-size: 38px; font-weight: 900; display: block; text-shadow: 0 2px 4px rgba(0,0,0,0.1);">87%</span>
+    <span style="color: rgba(255,255,255,0.95); font-size: 13px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px;">Metric</span>
   </div>
-  <p style="color: #1f2937; margin: 0; font-size: 16px; line-height: 1.7; flex: 1; min-width: 200px;">Explanation of what this stat means and why it matters.</p>
+  <p style="color: #1f2937; margin: 0; font-size: 17px; line-height: 1.8; flex: 1; min-width: 220px;">Explanation of what this stat means and why it matters to the reader.</p>
 </div>
 
-9. FAQ SECTION (6-8 questions at end):
-<div style="background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 12px; margin: 20px 0; overflow: hidden;">
-  <h4 style="background: #f3f4f6; margin: 0; padding: 18px 24px; color: #1f2937; font-size: 17px; font-weight: 700; border-bottom: 1px solid #e5e7eb;">
-    ❓ Question here?
+9. FAQ SECTION (modern accordion-style design):
+<div style="background: white; border: 2px solid #e5e7eb; border-radius: 16px; margin: 24px 0; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.05);">
+  <h4 style="background: linear-gradient(135deg, #f9fafb 0%, #f3f4f6 100%); margin: 0; padding: 20px 28px; color: #1f2937; font-size: 18px; font-weight: 700; border-bottom: 2px solid #e5e7eb; display: flex; align-items: center; gap: 12px;">
+    <span style="color: #10b981; font-size: 20px;">❓</span> Question here?
   </h4>
-  <div style="padding: 20px 24px;">
-    <p style="color: #4b5563; margin: 0; font-size: 16px; line-height: 1.7;">Direct, valuable answer without fluff.</p>
+  <div style="padding: 24px 28px;">
+    <p style="color: #4b5563; margin: 0; font-size: 17px; line-height: 1.8;">Direct, valuable answer without fluff. Give them exactly what they need.</p>
   </div>
 </div>
 
-10. CTA BOX (at the end):
-<div style="background: #10b981; border-radius: 12px; padding: 32px; margin: 40px 0; text-align: center;">
-  <h3 style="color: white; margin: 0 0 12px 0; font-size: 24px; font-weight: 800;">🚀 Ready to Take Action?</h3>
-  <p style="color: rgba(255,255,255,0.95); margin: 0; font-size: 17px; line-height: 1.6;">Strong call-to-action that tells them exactly what to do next.</p>
+10. CTA BOX (high-converting premium design):
+<div style="background: linear-gradient(135deg, #10b981 0%, #059669 100%); border-radius: 20px; padding: 40px; margin: 48px 0; text-align: center; box-shadow: 0 8px 30px rgba(16, 185, 129, 0.35);">
+  <h3 style="color: white; margin: 0 0 16px 0; font-size: 28px; font-weight: 900; text-shadow: 0 2px 4px rgba(0,0,0,0.1);">🚀 Ready to Take Action?</h3>
+  <p style="color: rgba(255,255,255,0.95); margin: 0; font-size: 18px; line-height: 1.7; max-width: 600px; margin: 0 auto;">Strong call-to-action that tells them exactly what to do next. Make it impossible to ignore.</p>
+</div>
+
+11. EXPERIENCE/CASE STUDY BOX (E-E-A-T first-hand experience):
+<div style="background: linear-gradient(135deg, #fefce8 0%, #fef9c3 100%); border: 2px solid #eab308; border-radius: 16px; padding: 28px 32px; margin: 36px 0; box-shadow: 0 4px 15px rgba(234, 179, 8, 0.15);">
+  <h4 style="color: #854d0e; margin: 0 0 16px 0; font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 10px;">📋 My Personal Experience</h4>
+  <p style="color: #1f2937; margin: 0; font-size: 17px; line-height: 1.8;">Share your first-hand experience, what you tested, results you achieved, and lessons learned. This builds E-E-A-T trust signals.</p>
+</div>
+
+12. RESEARCH/DATA BOX (E-E-A-T authority signal):
+<div style="background: linear-gradient(135deg, #f5f3ff 0%, #ede9fe 100%); border: 2px solid #8b5cf6; border-radius: 16px; padding: 28px 32px; margin: 36px 0; box-shadow: 0 4px 15px rgba(139, 92, 246, 0.15);">
+  <h4 style="color: #5b21b6; margin: 0 0 16px 0; font-size: 20px; font-weight: 800; display: flex; align-items: center; gap: 10px;">📊 Research Findings</h4>
+  <p style="color: #1f2937; margin: 0; font-size: 17px; line-height: 1.8;">According to [Study Name, Year], researchers found that [specific finding with numbers]. This was based on [methodology/sample size].</p>
 </div>
 
 🎯 OUTPUT: Pure HTML only. No markdown. Proper h2/h3 hierarchy. Every paragraph MUST deliver VALUE. All text must be readable on light backgrounds (use dark text colors like #1f2937, #374151, #4b5563).`;
@@ -771,12 +916,17 @@ EMBED THIS VIDEO IN THE MIDDLE OF THE ARTICLE:
 8. FAQ section with 8 questions at the end (optimized for featured snippets)
 9. Strong CTA at the very end
 
-📝 E-E-A-T REQUIREMENTS (MANDATORY FOR 90%+):
-1. Include "According to [specific study/source, year]..." at least 5 times
-2. Include at least 3 expert quotes: "Dr./Expert [Name], [credential], says..."
-3. Include first-person experience: "In my X years of experience..." / "When I tested this..."
-4. Reference specific tools/products by name that you've "used"
-5. Include 2025 statistics: "[X]% of [audience] report that... (Source, 2025)"
+📝 E-E-A-T REQUIREMENTS (MANDATORY FOR 90%+ - CRITICAL):
+1. Include "According to [specific study/source, year]..." at least 8 times throughout
+2. Include at least 4-5 expert quotes with REAL names: "Dr. [Full Name], [PhD/MD/credential] at [Institution], says..."
+3. Include 2-3 "My Personal Experience" sections: "When I personally tested this for 6 months..." / "In my 12 years of..."
+4. Reference 5+ specific tools/products by name that you've "used" with specific results
+5. Include 8+ specific statistics with years: "[X]% of [audience] report that... (Source, 2025)"
+6. Add 1-2 RESEARCH FINDINGS boxes using the template above
+7. Add 1-2 EXPERIENCE boxes using the template above
+8. Cite authoritative organizations: CDC, WHO, NIH, peer-reviewed journals, industry reports
+9. Include specific methodologies: "Using the [Protocol Name] methodology..." / "Based on meta-analysis of [X] studies..."
+10. Acknowledge limitations: "One caveat is..." / "This works best for..." - builds trust
 
 🎯 HUMAN VOICE REQUIREMENTS (MANDATORY):
 1. Use contractions: don't, won't, can't, it's, that's, we're, you'll
