@@ -332,6 +332,19 @@ export class NeuronWriterService {
 
     const data = result.data;
     
+    console.log(`[NeuronWriter] Raw query response keys:`, Object.keys(data || {}));
+    console.log(`[NeuronWriter] Raw terms keys:`, Object.keys(data?.terms || {}));
+    console.log(`[NeuronWriter] Raw terms_txt keys:`, Object.keys(data?.terms_txt || {}));
+    if (data?.terms) {
+      console.log(`[NeuronWriter] terms.h2:`, typeof data.terms.h2, Array.isArray(data.terms.h2) ? `(${data.terms.h2.length} items)` : '');
+      console.log(`[NeuronWriter] terms.h3:`, typeof data.terms.h3, Array.isArray(data.terms.h3) ? `(${data.terms.h3.length} items)` : '');
+      console.log(`[NeuronWriter] entities:`, typeof data.terms.entities, Array.isArray(data.terms.entities) ? `(${data.terms.entities.length} items)` : '');
+    }
+    if (data?.terms_txt) {
+      console.log(`[NeuronWriter] terms_txt.h2:`, typeof data.terms_txt.h2, data.terms_txt.h2 ? `(${String(data.terms_txt.h2).split('\\n').filter(Boolean).length} lines)` : 'empty');
+      console.log(`[NeuronWriter] terms_txt.h3:`, typeof data.terms_txt.h3, data.terms_txt.h3 ? `(${String(data.terms_txt.h3).split('\\n').filter(Boolean).length} lines)` : 'empty');
+    }
+    
     if (data?.status !== 'ready') {
       return { 
         success: false, 
@@ -380,8 +393,8 @@ export class NeuronWriterService {
     }
 
     const headingsH2: NeuronWriterHeading[] = [];
-    if (data.terms?.headings_h2) {
-      data.terms.headings_h2.forEach((h: any) => {
+    if (data.terms?.h2 && Array.isArray(data.terms.h2)) {
+      data.terms.h2.forEach((h: any) => {
         headingsH2.push({
           text: h.t,
           level: 'h2',
@@ -389,16 +402,34 @@ export class NeuronWriterService {
           sugg_usage: h.sugg_usage,
         });
       });
+    } else if (data.terms_txt?.h2 && typeof data.terms_txt.h2 === 'string') {
+      const h2Lines = data.terms_txt.h2.split('\n').filter((line: string) => line.trim());
+      h2Lines.forEach((line: string, idx: number) => {
+        headingsH2.push({
+          text: line.trim(),
+          level: 'h2',
+          usage_pc: Math.max(80 - idx * 5, 30),
+        });
+      });
     }
 
     const headingsH3: NeuronWriterHeading[] = [];
-    if (data.terms?.headings_h3) {
-      data.terms.headings_h3.forEach((h: any) => {
+    if (data.terms?.h3 && Array.isArray(data.terms.h3)) {
+      data.terms.h3.forEach((h: any) => {
         headingsH3.push({
           text: h.t,
           level: 'h3',
           usage_pc: h.usage_pc || 20,
           sugg_usage: h.sugg_usage,
+        });
+      });
+    } else if (data.terms_txt?.h3 && typeof data.terms_txt.h3 === 'string') {
+      const h3Lines = data.terms_txt.h3.split('\n').filter((line: string) => line.trim());
+      h3Lines.forEach((line: string, idx: number) => {
+        headingsH3.push({
+          text: line.trim(),
+          level: 'h3',
+          usage_pc: Math.max(60 - idx * 3, 20),
         });
       });
     }

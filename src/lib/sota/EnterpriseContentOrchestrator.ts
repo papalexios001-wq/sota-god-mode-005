@@ -238,13 +238,30 @@ Now continue:`;
       this.log(`NeuronWriter: searching for existing query matching "${keyword}"...`);
       const searchResult = await service.findQueryByKeyword(projectId, keyword);
       
-      if (searchResult.success && searchResult.query) {
-        queryId = searchResult.query.id;
+      if (searchResult.success && searchResult.query && searchResult.query.status === 'ready') {
+        const tempQueryId = searchResult.query.id;
         const status = searchResult.query.status || 'unknown';
-        this.log(`NeuronWriter: ✅ FOUND existing query "${searchResult.query.keyword}" (ID: ${queryId}, status: ${status}) - using it!`);
-      } else {
-        // STEP 2: Only create NEW query if none exists
-        this.log(`NeuronWriter: no existing query found, creating new Content Writer query...`);
+        this.log(`NeuronWriter: Found existing query "${searchResult.query.keyword}" (ID: ${tempQueryId}, status: ${status})`);
+        
+        const existingAnalysis = await service.getQueryAnalysis(tempQueryId);
+        if (existingAnalysis.success && existingAnalysis.analysis) {
+          const hasGoodData = (existingAnalysis.analysis.terms?.length || 0) >= 5 && 
+                              ((existingAnalysis.analysis.headingsH2?.length || 0) >= 2 || 
+                               (existingAnalysis.analysis.headingsH3?.length || 0) >= 2);
+          
+          if (hasGoodData) {
+            queryId = tempQueryId;
+            this.log(`NeuronWriter: ✅ Existing query has good data - using it!`);
+          } else {
+            this.log(`NeuronWriter: ⚠️ Existing query has insufficient data (${existingAnalysis.analysis.terms?.length || 0} terms, ${existingAnalysis.analysis.headingsH2?.length || 0} H2s, ${existingAnalysis.analysis.headingsH3?.length || 0} H3s)`);
+            this.log(`NeuronWriter: Creating fresh query for better analysis...`);
+          }
+        }
+      }
+      
+      if (!queryId) {
+        // STEP 2: Create NEW query if none exists or existing has bad data
+        this.log(`NeuronWriter: Creating new Content Writer query for "${keyword}"...`);
         const created = await service.createQuery(projectId, keyword);
         if (!created.success || !created.queryId) {
           this.log(`NeuronWriter: ❌ FAILED to create query - ${created.error || 'unknown error'}`);
