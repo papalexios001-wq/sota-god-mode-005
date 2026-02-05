@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef, useState, useEffect } from "react";
 import { useOptimizerStore } from "@/lib/store";
 import { 
   BookOpen, FileText, Target, RefreshCw, FolderOpen, Image,
@@ -52,6 +52,16 @@ export function ContentStrategy() {
   const [selectedUrls, setSelectedUrls] = useState<Set<string>>(new Set());
   const crawlRunIdRef = useRef(0);
   const crawlAbortRef = useRef<AbortController | null>(null);
+
+  // Initialize crawledUrls from persisted sitemapUrls when component mounts
+  // This ensures the crawled URLs survive navigation
+  useEffect(() => {
+    if (sitemapUrls.length > 0 && crawledUrls.length === 0 && !isCrawling) {
+      setCrawledUrls(sitemapUrls);
+      setCrawlFoundCount(sitemapUrls.length);
+      setCrawlStatus(`Previously crawled • ${sitemapUrls.length.toLocaleString()} blog posts loaded`);
+    }
+  }, [sitemapUrls, crawledUrls.length, isCrawling]);
 
   // Filter to keep only blog post URLs (exclude images, feeds, categories, tags, etc.)
   const filterBlogPostUrls = (urls: string[]): string[] => {
