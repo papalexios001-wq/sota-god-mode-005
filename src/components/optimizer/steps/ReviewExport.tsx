@@ -175,7 +175,7 @@ export function ReviewExport() {
   }, []);
 
   const handleGenerate = async () => {
-    const toGenerate = contentItems.filter(i => selectedItems.includes(i.id) && (i.status === 'pending' || i.status === 'error'));
+    const toGenerate = contentItems.filter(i => selectedItems.includes(i.id));
     if (toGenerate.length === 0) return;
 
     // Initialize generation state
