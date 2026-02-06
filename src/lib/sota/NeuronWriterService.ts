@@ -133,7 +133,7 @@ export class NeuronWriterService {
       if (result.success || result.error !== '__fallback__') return result;
     }
 
-    return this.executeProxyRequest<T>('/api/neuronwriter-proxy', { 'Content-Type': 'application/json' }, payload, 'express');
+    return this.executeProxyRequest<T>('/api/neuronwriter', { 'Content-Type': 'application/json' }, payload, 'express');
   }
 
   private async executeProxyRequest<T>(
