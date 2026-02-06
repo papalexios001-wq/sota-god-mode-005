@@ -307,35 +307,52 @@ export function registerRoutes(app: Express): void {
       } = req.body;
 
       if (!wpUrl || !username || !appPassword || !title || !content) {
-        return res.status(400).json({
+        res.status(400).json({
           success: false,
           error: "Missing required fields: wpUrl, username, appPassword, title, content",
         });
+        return;
       }
 
       let baseUrl = wpUrl.trim().replace(/\/+$/, "");
       if (!baseUrl.startsWith("http")) {
         baseUrl = `https://${baseUrl}`;
       }
-      const apiUrl = `${baseUrl}/wp-json/wp/v2/posts`;
 
+      if (!isPublicUrl(baseUrl)) {
+        res.status(400).json({ success: false, error: "WordPress URL must be a public HTTP/HTTPS address" });
+        return;
+      }
+
+      const apiUrl = `${baseUrl}/wp-json/wp/v2/posts`;
       const authString = `${username}:${appPassword}`;
       const authBase64 = Buffer.from(authString).toString("base64");
 
-      const authHeaders = {
+      const authHeaders: Record<string, string> = {
         Authorization: `Basic ${authBase64}`,
         "Content-Type": "application/json",
         Accept: "application/json",
       };
 
-      let targetPostId: number | null = existingPostId ? parseInt(existingPostId, 10) : null;
+      const wpFetch = async (url: string, options: RequestInit = {}): Promise<globalThis.Response> => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        try {
+          return await fetch(url, { ...options, signal: controller.signal });
+        } finally {
+          clearTimeout(timeoutId);
+        }
+      };
+
+      let targetPostId: number | null = existingPostId ? parseInt(String(existingPostId), 10) : null;
+      if (targetPostId !== null && isNaN(targetPostId)) targetPostId = null;
 
       if (!targetPostId && slug) {
         try {
           const cleanSlug = slug.replace(/^\/+|\/+$/g, "").split("/").pop() || slug;
           console.log(`[WordPress] Searching for existing post with slug: ${cleanSlug}`);
           const searchUrl = `${apiUrl}?slug=${encodeURIComponent(cleanSlug)}&status=any`;
-          const searchRes = await fetch(searchUrl, { headers: authHeaders });
+          const searchRes = await wpFetch(searchUrl, { headers: authHeaders });
           if (searchRes.ok) {
             const posts = await searchRes.json();
             if (Array.isArray(posts) && posts.length > 0) {
@@ -355,7 +372,7 @@ export function registerRoutes(app: Express): void {
             const sourceSlug = pathMatch[1].replace(/\/$/, "");
             console.log(`[WordPress] Searching for existing post with source slug: ${sourceSlug}`);
             const searchUrl = `${apiUrl}?slug=${encodeURIComponent(sourceSlug)}&status=any`;
-            const searchRes = await fetch(searchUrl, { headers: authHeaders });
+            const searchRes = await wpFetch(searchUrl, { headers: authHeaders });
             if (searchRes.ok) {
               const posts = await searchRes.json();
               if (Array.isArray(posts) && posts.length > 0) {
@@ -399,11 +416,26 @@ export function registerRoutes(app: Express): void {
 
       console.log(`[WordPress] ${method} to ${targetUrl}`);
 
-      const response = await fetch(targetUrl, {
-        method,
-        headers: authHeaders,
-        body: JSON.stringify(postData),
-      });
+      let response: globalThis.Response;
+      try {
+        response = await wpFetch(targetUrl, {
+          method,
+          headers: authHeaders,
+          body: JSON.stringify(postData),
+        });
+      } catch (fetchErr) {
+        const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+        const isTimeout = msg.includes("abort") || msg.includes("timeout");
+        console.error(`[WordPress] Fetch failed: ${msg}`);
+        res.status(isTimeout ? 504 : 502).json({
+          success: false,
+          error: isTimeout
+            ? "Connection to WordPress timed out after 60 seconds. Check that the URL is correct and the site is reachable."
+            : `Could not connect to WordPress: ${msg}`,
+          status: isTimeout ? 504 : 502,
+        });
+        return;
+      }
 
       const responseText = await response.text();
 
@@ -412,24 +444,26 @@ export function registerRoutes(app: Express): void {
         try {
           const errorData = JSON.parse(responseText);
           errorMessage = errorData.message || errorData.error || errorMessage;
-
-          if (response.status === 401) {
-            errorMessage = "Authentication failed. Check your username and application password.";
-          } else if (response.status === 403) {
-            errorMessage = "Permission denied. Ensure the user has publish capabilities.";
-          } else if (response.status === 404) {
-            errorMessage = "WordPress REST API not found. Ensure permalinks are enabled and REST API is accessible.";
-          }
         } catch {}
 
-        return res.json({ success: false, error: errorMessage, status: response.status });
+        if (response.status === 401) {
+          errorMessage = "Authentication failed. Check your username and application password.";
+        } else if (response.status === 403) {
+          errorMessage = "Permission denied. Ensure the user has publish capabilities.";
+        } else if (response.status === 404) {
+          errorMessage = "WordPress REST API not found. Ensure permalinks are enabled and REST API is accessible.";
+        }
+
+        res.json({ success: false, error: errorMessage, status: response.status });
+        return;
       }
 
       let post: { id: number; link: string; status: string; title?: { rendered: string }; slug: string };
       try {
         post = JSON.parse(responseText);
       } catch {
-        return res.json({ success: false, error: "Invalid response from WordPress" });
+        res.json({ success: false, error: "Invalid response from WordPress" });
+        return;
       }
 
       res.json({
@@ -444,11 +478,13 @@ export function registerRoutes(app: Express): void {
         },
       });
     } catch (error) {
-      console.error("[WordPress] Error:", error);
-      res.json({
-        success: false,
-        error: error instanceof Error ? error.message : "Unknown error occurred",
-      });
+      console.error("[WordPress] Unexpected error:", error);
+      if (!res.headersSent) {
+        res.status(500).json({
+          success: false,
+          error: error instanceof Error ? error.message : "Unknown server error",
+        });
+      }
     }
   });
 
